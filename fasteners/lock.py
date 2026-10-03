@@ -21,6 +21,7 @@ import collections
 import contextlib
 import functools
 import threading
+import time
 from typing import Optional
 
 from fasteners import _utils
@@ -47,6 +48,8 @@ class ReaderWriterLock(object):
         self._writer_entries = 0
         self._pending_writers = collections.deque()
         self._readers = {}
+        self._upgrader = None
+        self._upgrade_waiting = False
         self._cond = condition_cls()
         self._current_thread = current_thread_functor
 
@@ -85,6 +88,27 @@ class ReaderWriterLock(object):
         """
         me = self._current_thread()
         return me in self._readers
+
+    def is_upgrader(self) -> bool:
+        """Check if caller holds the upgrade intent.
+
+        Returns:
+            Whether the caller holds the (single) upgrade intent, i.e. it
+            acquired its read lock(s) via
+            :py:meth:`acquire_upgradable_read_lock` and has not released
+            them (or upgraded) yet.
+        """
+        me = self._current_thread()
+        return self._upgrader == me
+
+    @property
+    def has_pending_upgrader(self) -> bool:
+        """Check if some thread currently holds the upgrade intent.
+
+        Returns:
+            Whether a thread currently holds the upgrade intent.
+        """
+        return self._upgrader is not None
 
     @property
     def owner(self) -> Optional[str]:
@@ -135,7 +159,9 @@ class ReaderWriterLock(object):
                         # ok to get a lock if current thread already has one
                         self._readers[me] = self._readers[me] + 1
                         break
-                    elif (self._writer == me) or not self.has_pending_writers:
+                    elif ((self._writer == me) or
+                          (not self.has_pending_writers and
+                           not self._upgrade_waiting)):
                         self._readers[me] = 1
                         break
                 # An active or pending writer; guess we have to wait.
@@ -153,6 +179,10 @@ class ReaderWriterLock(object):
                     self._readers[me] = me_instances - 1
                 else:
                     self._readers.pop(me)
+                    if self._upgrader == me:
+                        # Last read hold of the upgrader is gone, so the
+                        # upgrade intent is released as well.
+                        self._upgrader = None
             except KeyError:
                 if raise_on_not_owned:
                     raise RuntimeError(f"Thread {me} does not own a read lock")
@@ -174,6 +204,161 @@ class ReaderWriterLock(object):
         finally:
             self._release_read_lock(me, raise_on_not_owned=False)
 
+    def _acquire_upgradable_read_lock(self, me):
+        if me in self._pending_writers:
+            raise RuntimeError("Writer %s can not acquire a read lock"
+                               " while waiting for the write lock"
+                               % me)
+        with self._cond:
+            while True:
+                # Only one thread at a time may hold the upgrade intent;
+                # everyone else wanting it has to wait for it to be
+                # released (or consumed by a successful upgrade).
+                if self._upgrader is None or self._upgrader == me:
+                    if self._writer is None or self._writer == me:
+                        if me in self._readers:
+                            # ok to get a lock if current thread already
+                            # has one
+                            self._readers[me] = self._readers[me] + 1
+                            self._upgrader = me
+                            break
+                        elif ((self._writer == me) or
+                              (not self.has_pending_writers and
+                               not self._upgrade_waiting)):
+                            self._readers[me] = 1
+                            self._upgrader = me
+                            break
+                self._cond.wait()
+
+    def acquire_upgradable_read_lock(self):
+        """Acquire a read lock that may later be upgraded to a write lock.
+
+        Behaves like :py:meth:`acquire_read_lock` but additionally takes the
+        (single) upgrade intent of this lock. At most one thread at a time
+        may hold the upgrade intent; other threads calling this method wait
+        until the current holder releases its read lock(s) or completes an
+        upgrade.
+
+        Release it with :py:meth:`release_read_lock` (which also drops the
+        upgrade intent once the last read hold is released) or convert it
+        into a write lock with :py:meth:`upgrade_read_lock`.
+
+        Raises:
+            RuntimeError: if a pending writer tries to acquire a read lock.
+        """
+        me = self._current_thread()
+        self._acquire_upgradable_read_lock(me)
+
+    @contextlib.contextmanager
+    def upgradable_read_lock(self):
+        """Context manager that grants an upgradable read lock.
+
+        Will wait until no active or pending writers and until no other
+        thread holds the upgrade intent.
+
+        Raises:
+            RuntimeError: if a pending writer tries to acquire a read lock.
+        """
+        me = self._current_thread()
+        self._acquire_upgradable_read_lock(me)
+        try:
+            yield self
+        finally:
+            self._release_read_lock(me, raise_on_not_owned=False)
+
+    def upgrade_read_lock(self, timeout=None) -> bool:
+        """Upgrade the caller's upgradable read lock into a write lock.
+
+        The caller must currently hold the upgrade intent (see
+        :py:meth:`acquire_upgradable_read_lock`). The caller's read hold(s)
+        are dropped and new readers (and pending writers) are blocked while
+        waiting for the remaining readers and any active writer to leave;
+        the caller then becomes the writer without ever giving others a
+        chance to slip a writer in-between.
+
+        Args:
+            timeout:
+                Optional maximum number of seconds to wait for the lock to
+                become upgradable. If not provided, wait forever.
+
+        Returns:
+            Whether the upgrade succeeded. If it did not (i.e. the timeout
+            expired) the caller keeps its original read lock(s), including
+            their reentrancy count, and still holds the upgrade intent.
+
+        Raises:
+            RuntimeError: if the caller does not hold an upgradable read
+                lock (plain readers can not upgrade).
+        """
+        me = self._current_thread()
+        with self._cond:
+            if self._writer == me:
+                # Already the active writer; nothing left to upgrade to.
+                return True
+            if self._upgrader != me or me not in self._readers:
+                raise RuntimeError("Thread %s does not own an upgradable"
+                                   " read lock" % me)
+            # Drop our read hold(s) while remembering how reentrant they
+            # were so that a failed/timed out upgrade can restore them
+            # exactly; block new readers from barging in while we wait for
+            # the remaining readers (and any active writer) to leave.
+            read_count = self._readers.pop(me)
+            self._upgrade_waiting = True
+            deadline = None
+            if timeout is not None:
+                deadline = time.monotonic() + timeout
+            acquired = False
+            try:
+                while True:
+                    if self._writer is None and not self._readers:
+                        acquired = True
+                        break
+                    if deadline is None:
+                        self._cond.wait()
+                    else:
+                        remaining = deadline - time.monotonic()
+                        if remaining <= 0:
+                            break
+                        self._cond.wait(remaining)
+            except BaseException:
+                self._readers[me] = read_count
+                self._upgrade_waiting = False
+                self._cond.notify_all()
+                raise
+            self._upgrade_waiting = False
+            if not acquired:
+                # Restore the caller's original read lock level(s).
+                self._readers[me] = read_count
+                self._cond.notify_all()
+                return False
+            self._writer = me
+            self._writer_entries = 1
+            self._upgrader = None
+            self._cond.notify_all()
+            return True
+
+    def downgrade_write_lock(self):
+        """Atomically downgrade the caller's write lock into a read lock.
+
+        The caller must be the active writer. The write lock (including all
+        of its reentrant entries) is converted into a single read lock hold
+        in one atomic step, so no other writer (or reader, had the caller
+        fully released instead) can acquire the lock in-between. Other
+        readers may enter as soon as the downgrade happens; pending writers
+        still wait until the caller releases its read lock.
+
+        Raises:
+            RuntimeError: if the caller does not own the write lock.
+        """
+        me = self._current_thread()
+        with self._cond:
+            if self._writer != me:
+                raise RuntimeError(f"Thread {me} does not own a write lock")
+            self._writer = None
+            self._writer_entries = 0
+            self._readers[me] = self._readers.get(me, 0) + 1
+            self._cond.notify_all()
+
     def _acquire_write_lock(self, me):
         if self.is_reader():
             raise RuntimeError("Reader %s to writer privilege"
@@ -183,7 +368,11 @@ class ReaderWriterLock(object):
             self._pending_writers.append(me)
             while True:
                 # No readers, and no active writer, am I next??
-                if len(self._readers) == 0 and self._writer is None:
+                # An upgrader waiting to convert its read lock takes
+                # precedence over queued writers (it already holds part of
+                # the lock, so letting writers go first could deadlock).
+                if (len(self._readers) == 0 and self._writer is None
+                        and not self._upgrade_waiting):
                     if self._pending_writers[0] == me:
                         self._writer = self._pending_writers.popleft()
                         self._writer_entries = 1

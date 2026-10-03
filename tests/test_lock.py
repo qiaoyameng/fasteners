@@ -592,3 +592,221 @@ def test_error_when_releasing_read_lock_without_read_lock():
     lock = fasteners.ReaderWriterLock()
     with pytest.raises(RuntimeError):
         lock.release_read_lock()
+
+
+def test_upgradable_read_lock_ctx():
+    lock = fasteners.ReaderWriterLock()
+    with lock.upgradable_read_lock():
+        assert lock.is_reader()
+        assert lock.is_upgrader()
+        assert lock.has_pending_upgrader
+        assert lock.upgrade_read_lock(timeout=WAIT_TIMEOUT)
+        assert lock.is_writer(check_pending=False)
+        assert not lock.is_reader()
+        assert not lock.has_pending_upgrader
+        lock.downgrade_write_lock()
+        assert lock.is_reader()
+        assert not lock.is_writer(check_pending=False)
+    assert lock.owner is None
+
+
+def test_plain_reader_can_not_upgrade():
+    lock = fasteners.ReaderWriterLock()
+    lock.acquire_read_lock()
+    try:
+        with pytest.raises(RuntimeError):
+            lock.upgrade_read_lock(timeout=0.1)
+        # A failed attempt must not have disturbed the read lock.
+        assert lock.is_reader()
+    finally:
+        lock.release_read_lock()
+    assert lock.owner is None
+
+
+def test_only_one_upgradable_reader_at_a_time():
+    lock = fasteners.ReaderWriterLock()
+    first_holds = threading.Event()
+    first_release = threading.Event()
+    second_acquired = threading.Event()
+
+    def first():
+        lock.acquire_upgradable_read_lock()
+        first_holds.set()
+        first_release.wait(WAIT_TIMEOUT)
+        lock.release_read_lock()
+
+    def second():
+        assert first_holds.wait(WAIT_TIMEOUT)
+        lock.acquire_upgradable_read_lock()
+        second_acquired.set()
+        lock.release_read_lock()
+
+    t1 = _daemon_thread(first)
+    t2 = _daemon_thread(second)
+    t1.start()
+    t2.start()
+    assert first_holds.wait(WAIT_TIMEOUT)
+    time.sleep(NAPPY_TIME)
+    # The second thread is blocked waiting for the upgrade intent even
+    # though a plain read lock would be grantable right away.
+    assert not second_acquired.is_set()
+    first_release.set()
+    assert second_acquired.wait(WAIT_TIMEOUT)
+    t1.join()
+    t2.join()
+    assert not lock.has_pending_upgrader
+
+
+def test_upgrade_read_lock_timeout_preserves_read_holds():
+    lock = fasteners.ReaderWriterLock()
+    lock.acquire_upgradable_read_lock()
+    lock.acquire_upgradable_read_lock()
+    other_has_read = threading.Event()
+    other_release = threading.Event()
+
+    def other_reader():
+        lock.acquire_read_lock()
+        other_has_read.set()
+        other_release.wait(WAIT_TIMEOUT)
+        lock.release_read_lock()
+
+    t = _daemon_thread(other_reader)
+    t.start()
+    assert other_has_read.wait(WAIT_TIMEOUT)
+    # The other reader never leaves in time, so the upgrade must fail and
+    # our two read holds (and the upgrade intent) must be kept intact.
+    assert lock.upgrade_read_lock(timeout=0.2) is False
+    assert lock.is_reader()
+    assert lock.is_upgrader()
+    lock.release_read_lock()
+    assert lock.is_reader()
+    assert lock.is_upgrader()
+    lock.release_read_lock()
+    assert not lock.is_reader()
+    assert not lock.has_pending_upgrader
+    other_release.set()
+    t.join()
+    assert lock.owner is None
+
+
+def test_downgrade_write_lock():
+    lock = fasteners.ReaderWriterLock()
+    lock.acquire_write_lock()
+    lock.acquire_write_lock()
+    lock.downgrade_write_lock()
+    # All write entries were converted into a single read hold.
+    assert lock.is_reader()
+    assert not lock.is_writer(check_pending=False)
+    assert lock.owner == lock.READER
+    with pytest.raises(RuntimeError):
+        lock.release_write_lock()
+    lock.release_read_lock()
+    assert lock.owner is None
+
+
+def test_downgrade_requires_write_lock():
+    lock = fasteners.ReaderWriterLock()
+    with pytest.raises(RuntimeError):
+        lock.downgrade_write_lock()
+    lock.acquire_read_lock()
+    try:
+        with pytest.raises(RuntimeError):
+            lock.downgrade_write_lock()
+    finally:
+        lock.release_read_lock()
+
+
+def test_upgrade_downgrade_queued_writer_never_crosses():
+    # Two readers (one of them upgradable) and one queued writer walk
+    # through a barrier-scripted interleaving; the queued writer must
+    # never enter its critical section while the upgrader holds either
+    # its (upgraded) write lock or its (downgraded) read lock.
+    lock = fasteners.ReaderWriterLock()
+    events = collections.deque()
+    r1_has_upgradable = threading.Event()
+    r2_has_read = threading.Event()
+    r2_release = threading.Event()
+    r1_upgraded = threading.Event()
+    r1_downgraded = threading.Event()
+    r1_release = threading.Event()
+    writer_done = threading.Event()
+
+    def r1():
+        lock.acquire_upgradable_read_lock()
+        events.append(('r1', 'read-enter'))
+        r1_has_upgradable.set()
+        assert r2_has_read.wait(WAIT_TIMEOUT)
+        assert lock.upgrade_read_lock(timeout=WAIT_TIMEOUT)
+        events.append(('r1', 'write-enter'))
+        r1_upgraded.set()
+        time.sleep(NAPPY_TIME)
+        lock.downgrade_write_lock()
+        events.append(('r1', 'downgraded'))
+        r1_downgraded.set()
+        assert r1_release.wait(WAIT_TIMEOUT)
+        lock.release_read_lock()
+        events.append(('r1', 'read-exit'))
+
+    def r2():
+        assert r1_has_upgradable.wait(WAIT_TIMEOUT)
+        lock.acquire_read_lock()
+        events.append(('r2', 'read-enter'))
+        r2_has_read.set()
+        assert r2_release.wait(WAIT_TIMEOUT)
+        lock.release_read_lock()
+        events.append(('r2', 'read-exit'))
+
+    def queued_writer():
+        assert r2_has_read.wait(WAIT_TIMEOUT)
+        lock.acquire_write_lock()
+        events.append(('w', 'write-enter'))
+        time.sleep(NAPPY_TIME)
+        events.append(('w', 'write-exit'))
+        lock.release_write_lock()
+        writer_done.set()
+
+    threads = [_daemon_thread(r1), _daemon_thread(r2),
+               _daemon_thread(queued_writer)]
+    for t in threads:
+        t.start()
+
+    # Both readers hold their locks; r1 is already blocked inside its
+    # upgrade request because r2 is still an active reader.
+    assert r2_has_read.wait(WAIT_TIMEOUT)
+    time.sleep(NAPPY_TIME)
+    assert not r1_upgraded.is_set()
+
+    # Wait until the writer is actually queued behind the readers.
+    deadline = time.monotonic() + WAIT_TIMEOUT
+    while not lock.has_pending_writers:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+    # Let r2 go; the upgrader (not the queued writer) must win the lock.
+    r2_release.set()
+    assert r1_upgraded.wait(WAIT_TIMEOUT)
+    assert not any(event == ('w', 'write-enter') for event in events)
+
+    # After the downgrade the queued writer must still be locked out
+    # because r1 atomically became a reader instead of fully releasing.
+    assert r1_downgraded.wait(WAIT_TIMEOUT)
+    time.sleep(NAPPY_TIME)
+    assert not any(event == ('w', 'write-enter') for event in events)
+
+    # Only once r1 releases its downgraded read lock may the writer in.
+    r1_release.set()
+    assert writer_done.wait(WAIT_TIMEOUT)
+    for t in threads:
+        t.join()
+
+    kinds = {actor: [action for (a, action) in events if a == actor]
+             for actor in ('r1', 'r2', 'w')}
+    assert kinds['r1'] == ['read-enter', 'write-enter', 'downgraded',
+                           'read-exit']
+    assert kinds['r2'] == ['read-enter', 'read-exit']
+    assert kinds['w'] == ['write-enter', 'write-exit']
+    # No other writer crossed before or after the downgrade: the queued
+    # writer's section comes strictly after r1 fully released.
+    assert list(events).index(('w', 'write-enter')) > \
+        list(events).index(('r1', 'read-exit'))
+    assert lock.owner is None
