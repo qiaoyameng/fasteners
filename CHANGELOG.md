@@ -3,6 +3,8 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+  - Add `InterProcessMultiLock` for acquiring several interprocess locks in a
+    stable order with one shared timeout budget.
 
 ## [0.20]
   - InterProcessLock now catches OSError and handles BlockingIOError correctly.

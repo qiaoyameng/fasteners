@@ -29,6 +29,8 @@ from fasteners.process_lock import interprocess_locked
 from fasteners.process_lock import interprocess_read_locked
 from fasteners.process_lock import interprocess_write_locked
 from fasteners.process_lock import InterProcessLock
+from fasteners.process_lock import InterProcessMultiLock
+from fasteners.process_lock import InterProcessMultiLockError
 from fasteners.process_lock import InterProcessReaderWriterLock
 
 from fasteners.version import _VERSION as __version__
@@ -44,5 +46,7 @@ __all__ = [
     'interprocess_read_locked',
     'interprocess_write_locked',
     'InterProcessLock',
+    'InterProcessMultiLock',
+    'InterProcessMultiLockError',
     'InterProcessReaderWriterLock',
 ]

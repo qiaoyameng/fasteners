@@ -2,6 +2,8 @@
 
 ::: fasteners.process_lock.InterProcessLock
 
+::: fasteners.process_lock.InterProcessMultiLock
+
 ::: fasteners.process_lock.InterProcessReaderWriterLock
 
 ## Decorators

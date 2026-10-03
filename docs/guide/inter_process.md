@@ -46,6 +46,34 @@ lock.acquire_write_lock(timeout=10)
 lock.release_write_lock()
 ```
 
+## Multiple locks
+
+Several locks can be acquired together using `InterProcessMultiLock`. Locks
+are always acquired by canonicalized path in one process-independent order and
+released in the reverse order:
+
+```python
+import fasteners
+
+locks = [
+    fasteners.InterProcessLock('path/to/a.lock'),
+    fasteners.InterProcessLock('path/to/b.lock'),
+]
+
+multi_lock = fasteners.InterProcessMultiLock(locks)
+multi_lock.acquire(timeout=10)
+try:
+    ... # exclusive access to all resources
+finally:
+    multi_lock.release()
+```
+
+The timeout is one shared budget for the complete acquisition. Duplicate
+paths are folded into one lock. Current-directory, parent-directory and
+symlink aliases are normalized; hard links and other filesystem aliases are
+not detected. Locks already held before entering the multi-lock are left held
+on exit.
+
 ## Decorators
 
 For extra sugar, a function that always needs exclusive / read / write access

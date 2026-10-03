@@ -29,12 +29,15 @@ LOG = logging.getLogger(__name__)
 def canonicalize_path(path):
     """Canonicalizes a potential path.
 
-    Returns a binary string encoded into filesystem encoding.
+    Returns the current-directory, parent-directory and symlink normalized
+    path as a binary string.
     """
+    if isinstance(path, os.PathLike):
+        path = os.fspath(path)
     if isinstance(path, bytes):
-        return path
+        return os.path.realpath(os.path.abspath(path))
     if isinstance(path, str):
-        return os.fsencode(path)
+        return os.fsencode(os.path.realpath(os.path.abspath(path)))
     else:
         return canonicalize_path(str(path))
 
