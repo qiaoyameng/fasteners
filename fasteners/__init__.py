@@ -26,9 +26,12 @@ from fasteners.lock import ReaderWriterLock
 from fasteners.lock import try_lock
 from fasteners.lock import write_locked
 from fasteners.process_lock import interprocess_locked
+from fasteners.process_lock import interprocess_locks
 from fasteners.process_lock import interprocess_read_locked
 from fasteners.process_lock import interprocess_write_locked
 from fasteners.process_lock import InterProcessLock
+from fasteners.process_lock import InterProcessMultiLock
+from fasteners.process_lock import InterProcessLockReleaseError
 from fasteners.process_lock import InterProcessReaderWriterLock
 
 from fasteners.version import _VERSION as __version__
@@ -41,8 +44,11 @@ __all__ = [
     'try_lock',
     'write_locked',
     'interprocess_locked',
+    'interprocess_locks',
     'interprocess_read_locked',
     'interprocess_write_locked',
     'InterProcessLock',
+    'InterProcessMultiLock',
+    'InterProcessLockReleaseError',
     'InterProcessReaderWriterLock',
 ]

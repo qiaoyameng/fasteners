@@ -3,6 +3,10 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+  - Add `InterProcessMultiLock` and `interprocess_locks` for acquiring several
+    interprocess locks in canonical path order with a shared timeout budget.
+  - Canonicalize interprocess lock paths as absolute paths with symlinks
+    resolved and preserve all errors when releasing multiple locks fails.
 
 ## [0.20]
   - InterProcessLock now catches OSError and handles BlockingIOError correctly.

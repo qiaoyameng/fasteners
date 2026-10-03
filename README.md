@@ -35,6 +35,15 @@ lock.acquire()
 lock.release()
 ```
 
+Several resources can be protected by one ordered context. Pass their paths in
+any order; they are acquired in canonical path order and share one timeout:
+
+```python
+with fasteners.interprocess_locks('resource-a.lock',
+                                  'resource-b.lock', timeout=10):
+    ... # exclusive access to both resources
+```
+
 Reader Writer lock has a similar API, which is the same for threads or processes:
 
 ```python

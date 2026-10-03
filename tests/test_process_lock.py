@@ -19,6 +19,7 @@ import contextlib
 import errno
 import multiprocessing
 import os
+import pathlib
 import shutil
 import sys
 import tempfile
@@ -284,3 +285,240 @@ def test_lock_twice(lock_dir):
 
     # should release without crashing
     lock.release()
+
+
+def test_multi_lock_normalizes_and_deduplicates_paths(lock_dir):
+    original = os.path.join(lock_dir, 'lock')
+    alias = os.path.join(lock_dir, 'alias')
+    os.symlink(original, alias)
+
+    old_cwd = os.getcwd()
+    os.chdir(lock_dir)
+    try:
+        multi_lock = pl.InterProcessMultiLock([
+            os.path.join('subdir', '..', 'lock'),
+            alias,
+            './lock',
+        ])
+    finally:
+        os.chdir(old_cwd)
+
+    assert [lock.path for lock in multi_lock.locks] == [original]
+
+
+@pytest.mark.skipif(WIN32, reason='Symlinks require developer mode on Windows')
+def test_multi_lock_deduplicates_dangling_symlink_alias(lock_dir):
+    original = os.path.join(lock_dir, 'future-lock')
+    alias = os.path.join(lock_dir, 'future-lock-alias')
+    os.symlink(original, alias)
+
+    multi_lock = pl.InterProcessMultiLock([
+        original,
+        alias,
+        os.path.join(lock_dir, '.', 'future-lock'),
+    ])
+
+    assert len(multi_lock.locks) == 1
+
+
+def test_multi_lock_orders_by_canonical_path(lock_dir):
+    paths = [os.path.join(lock_dir, name) for name in ('c', 'a', 'b')]
+    multi_lock = pl.InterProcessMultiLock(paths)
+
+    assert [lock.path for lock in multi_lock.locks] == sorted(paths)
+
+
+def test_multi_lock_accepts_path_like_and_bytes_paths(lock_dir):
+    paths = [
+        pathlib.Path(lock_dir) / 'path-like',
+        os.fsencode(os.path.join(lock_dir, 'bytes-path')),
+    ]
+
+    multi_lock = pl.InterProcessMultiLock(paths)
+
+    with multi_lock:
+        assert all(lock.acquired for lock in multi_lock.locks)
+
+    assert not multi_lock.acquired
+
+
+def test_multi_lock_does_not_release_previously_acquired_lock(lock_dir):
+    held_path = os.path.join(lock_dir, 'held')
+    other_path = os.path.join(lock_dir, 'other')
+    held_lock = pl.InterProcessLock(held_path)
+    assert held_lock.acquire(blocking=False)
+
+    try:
+        with pl.InterProcessMultiLock([
+            other_path,
+            held_lock,
+            held_path,
+        ]) as multi_lock:
+            assert multi_lock.previously_acquired == (held_lock,)
+            assert held_lock.acquired
+
+        assert held_lock.acquired
+        other_lock = pl.InterProcessLock(other_path)
+        assert other_lock.acquire(blocking=False)
+        other_lock.release()
+    finally:
+        held_lock.release()
+
+
+class RecordingLock:
+    def __init__(self, path, fail_release=False, consume=0.0):
+        self.path = path
+        self.acquired = False
+        self.fail_release = fail_release
+        self.consume = consume
+        self.timeouts = []
+
+    def acquire(self, blocking=True, delay=0.01, max_delay=0.1,
+                timeout=None, watch=None):
+        time.sleep(self.consume)
+        self.timeouts.append(timeout)
+        self.acquired = True
+        return True
+
+    def release(self):
+        self.acquired = False
+        if self.fail_release:
+            raise threading.ThreadError('release failed')
+
+
+def test_multi_lock_uses_one_shared_timeout_budget():
+    locks = [
+        RecordingLock('c', consume=0.01),
+        RecordingLock('a', consume=0.01),
+        RecordingLock('b', consume=0.01),
+    ]
+    multi_lock = pl.InterProcessMultiLock(locks)
+
+    assert multi_lock.acquire(timeout=5)
+
+    assert [lock.path for lock in multi_lock.locks] == ['a', 'b', 'c']
+    timeouts = [
+        lock.timeouts[0]
+        for lock in multi_lock.locks
+    ]
+    assert timeouts[0] < 5
+    assert timeouts[1] < timeouts[0]
+    assert timeouts[2] < timeouts[1]
+    multi_lock.release()
+    assert not any(lock.acquired for lock in multi_lock.locks)
+
+
+class FailingAcquireLock(RecordingLock):
+    def __init__(self, path, consume=0.05):
+        super().__init__(path, consume=consume)
+
+    def acquire(self, blocking=True, delay=0.01, max_delay=0.1,
+                timeout=None, watch=None):
+        time.sleep(self.consume)
+        self.timeouts.append(timeout)
+        if watch is not None and watch.expired():
+            return False
+        return super().acquire(blocking, delay, max_delay, timeout, watch)
+
+
+class RollbackLock(RecordingLock):
+    released = []
+
+    def release(self):
+        self.released.append(self.path)
+        super().release()
+
+
+def test_multi_lock_rolls_back_new_locks_in_reverse_order():
+    RollbackLock.released = []
+    locks = [
+        RollbackLock('a', consume=0.01),
+        RollbackLock('b', consume=0.01),
+        FailingAcquireLock('c'),
+    ]
+    multi_lock = pl.InterProcessMultiLock(locks)
+
+    assert not multi_lock.acquire(timeout=0.05)
+
+    assert RollbackLock.released == ['b', 'a']
+    assert not any(lock.acquired for lock in multi_lock.locks)
+
+
+def test_multi_lock_preserves_all_release_failures():
+    locks = [
+        RecordingLock('a', fail_release=True),
+        RecordingLock('b', fail_release=True),
+    ]
+    multi_lock = pl.InterProcessMultiLock(locks)
+    assert multi_lock.acquire()
+
+    with pytest.raises(pl.InterProcessLockReleaseError) as exc_info:
+        multi_lock.release()
+
+    assert len(exc_info.value.errors) == 2
+    assert [lock.path for lock, _ in exc_info.value.errors] == ['b', 'a']
+    assert all(not lock.acquired for lock in locks)
+
+
+def _hold_lock_worker(path, pipe):
+    with pl.InterProcessLock(path):
+        pipe.send(('held', path))
+        pipe.recv()
+
+
+def _multi_lock_worker(paths, pipe, timeout):
+    multi_lock = pl.InterProcessMultiLock(paths)
+    if multi_lock.acquire(timeout=timeout):
+        try:
+            pipe.send(('entered', None))
+            pipe.recv()
+        finally:
+            multi_lock.release()
+    else:
+        pipe.send(('failed', None))
+
+
+def test_multi_lock_opposite_order_processes_finish_and_releases(lock_dir):
+    paths = [os.path.join(lock_dir, name) for name in ('a', 'b', 'c')]
+    blocker_parent, blocker_child = multiprocessing.Pipe()
+    blocker = multiprocessing.Process(
+        target=_hold_lock_worker, args=(paths[-1], blocker_child))
+    blocker.start()
+
+    try:
+        assert blocker_parent.poll(5)
+        assert blocker_parent.recv() == ('held', paths[-1])
+
+        first_parent, first_child = multiprocessing.Pipe()
+        second_parent, second_child = multiprocessing.Pipe()
+        children = (
+            multiprocessing.Process(
+                target=_multi_lock_worker,
+                args=(paths, first_child, 0.5)),
+            multiprocessing.Process(
+                target=_multi_lock_worker,
+                args=(list(reversed(paths)), second_child, 0.5)),
+        )
+
+        with scoped_child_processes(children, timeout=10, exitcode=0):
+            assert first_parent.poll(5)
+            assert first_parent.recv() == ('failed', None)
+            assert second_parent.poll(5)
+            assert second_parent.recv() == ('failed', None)
+
+        assert all(os.path.exists(path) for path in paths)
+        blocker_parent.send(None)
+    finally:
+        blocker.join(5)
+        if blocker.is_alive():
+            blocker.terminate()
+            blocker.join()
+        blocker_parent.close()
+
+    third_parent, third_child = multiprocessing.Pipe()
+    third = multiprocessing.Process(
+        target=_multi_lock_worker, args=(paths, third_child, 5))
+    with scoped_child_processes((third,), timeout=10, exitcode=0):
+        assert third_parent.poll(5)
+        assert third_parent.recv() == ('entered', None)
+        third_parent.send(None)

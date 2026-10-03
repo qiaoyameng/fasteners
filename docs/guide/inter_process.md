@@ -46,6 +46,34 @@ lock.acquire_write_lock(timeout=10)
 lock.release_write_lock()
 ```
 
+## Multiple locks
+
+When one operation needs several resources, acquire all of their locks with
+`interprocess_locks` (or `InterProcessMultiLock`):
+
+```python
+import fasteners
+
+with fasteners.interprocess_locks('a.lock', 'b.lock', timeout=10):
+    ... # protected access to both resources
+```
+
+Paths are normalized and duplicates are coalesced using one stable global
+order, so callers may pass paths in different orders without creating a lock
+ordering deadlock. The timeout is one budget shared by every lock acquisition
+in the group; it is not restarted for each lock.
+
+Relative components, symlinks in existing parent directories, and a dangling
+final symlink whose target is the requested lock file are recognized as
+aliases. User shortcuts such as `~` are not expanded, hard links cannot be
+recognized, and a symlink changed after constructing the multi-lock object is
+not resolved again.
+
+If one lock cannot be acquired, locks already acquired by that attempt are
+released in reverse order. Locks which were already acquired before entering
+the context remain held. Lock files are never deleted to resolve contention.
+If multiple releases fail, the resulting exception preserves all failures.
+
 ## Decorators
 
 For extra sugar, a function that always needs exclusive / read / write access

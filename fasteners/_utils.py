@@ -29,14 +29,30 @@ LOG = logging.getLogger(__name__)
 def canonicalize_path(path):
     """Canonicalizes a potential path.
 
-    Returns a binary string encoded into filesystem encoding.
+    Returns an absolute path with symlinks resolved. User home directory
+    shortcuts (such as ``~``) are intentionally not expanded.
     """
+    path = os.fspath(path)
     if isinstance(path, bytes):
-        return path
-    if isinstance(path, str):
-        return os.fsencode(path)
-    else:
-        return canonicalize_path(str(path))
+        path = os.fsdecode(path)
+    return os.path.realpath(path)
+
+
+def canonicalize_path_key(path):
+    """Return a stable key for equivalent existing or future lock paths."""
+    path = os.fspath(path)
+    if isinstance(path, bytes):
+        path = os.fsdecode(path)
+    path = os.path.abspath(path)
+
+    missing_parts = []
+    while path and not os.path.lexists(path):
+        path, name = os.path.split(path)
+        missing_parts.append(name)
+
+    resolved = os.path.realpath(path) if path else os.path.sep
+    return os.path.normcase(
+        os.path.join(resolved, *reversed(missing_parts)))
 
 
 def pick_first_not_none(*values):
@@ -140,7 +156,11 @@ class StopWatch(object):
         return self
 
     def __exit__(self, exc_type, exc_value, exc_tb):
-        self.stopped_at = time.monotonic()
+        self.stop()
+
+    def stop(self):
+        if self.stopped_at is None:
+            self.stopped_at = time.monotonic()
 
     def start(self):
         self.started_at = time.monotonic()
