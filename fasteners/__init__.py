@@ -30,6 +30,8 @@ from fasteners.process_lock import interprocess_read_locked
 from fasteners.process_lock import interprocess_write_locked
 from fasteners.process_lock import InterProcessLock
 from fasteners.process_lock import InterProcessReaderWriterLock
+from fasteners.process_semaphore import InterProcessSemaphore
+from fasteners.process_semaphore import SemaphorePermit
 
 from fasteners.version import _VERSION as __version__
 
@@ -45,4 +47,6 @@ __all__ = [
     'interprocess_write_locked',
     'InterProcessLock',
     'InterProcessReaderWriterLock',
+    'InterProcessSemaphore',
+    'SemaphorePermit',
 ]
