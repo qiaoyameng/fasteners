@@ -30,6 +30,11 @@ from fasteners.process_lock import interprocess_read_locked
 from fasteners.process_lock import interprocess_write_locked
 from fasteners.process_lock import InterProcessLock
 from fasteners.process_lock import InterProcessReaderWriterLock
+from fasteners.process_lock import InterProcessSemaphore
+from fasteners.process_lock import InterProcessSemaphoreCapacityError
+from fasteners.process_lock import InterProcessSemaphoreError
+from fasteners.process_lock import InterProcessSemaphorePermit
+from fasteners.process_lock import InterProcessSemaphoreReleaseError
 
 from fasteners.version import _VERSION as __version__
 
@@ -45,4 +50,9 @@ __all__ = [
     'interprocess_write_locked',
     'InterProcessLock',
     'InterProcessReaderWriterLock',
+    'InterProcessSemaphore',
+    'InterProcessSemaphoreCapacityError',
+    'InterProcessSemaphoreError',
+    'InterProcessSemaphorePermit',
+    'InterProcessSemaphoreReleaseError',
 ]

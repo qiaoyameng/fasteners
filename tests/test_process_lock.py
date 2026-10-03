@@ -284,3 +284,192 @@ def test_lock_twice(lock_dir):
 
     # should release without crashing
     lock.release()
+
+
+def _semaphore_worker(path, capacity, conn):
+    semaphore = pl.InterProcessSemaphore(path, capacity)
+    permit = semaphore.acquire(timeout=10)
+    if permit is None:
+        conn.send(('error', 'timed out', os.getpid()))
+        return
+
+    conn.send(('entered', permit.slot, os.getpid()))
+    command = conn.recv()
+    if command == 'release':
+        permit.release()
+        conn.send(('released', permit.slot, os.getpid()))
+        conn.recv()
+
+
+def _release_inherited_permit(permit, conn):
+    try:
+        permit.release()
+    except Exception as e:
+        conn.send((type(e).__name__, str(e)))
+    else:
+        conn.send(None)
+
+
+def test_interprocess_semaphore_limits_capacity(lock_dir):
+    semaphore_path = os.path.join(lock_dir, 'semaphore')
+    semaphore = pl.InterProcessSemaphore(semaphore_path, 3)
+
+    permits = [semaphore.acquire() for _ in range(3)]
+    try:
+        assert len({permit.slot for permit in permits}) == 3
+        assert semaphore.acquire(blocking=False) is None
+    finally:
+        for permit in permits:
+            permit.release()
+
+    permit = semaphore.acquire(blocking=False)
+    assert permit is not None
+    permit.release()
+
+
+def test_interprocess_semaphore_acquire_timeout(lock_dir):
+    semaphore_path = os.path.join(lock_dir, 'semaphore')
+    semaphore = pl.InterProcessSemaphore(semaphore_path, 1)
+    permit = semaphore.acquire()
+
+    start = time.monotonic()
+    try:
+        assert semaphore.acquire(timeout=0.05) is None
+    finally:
+        permit.release()
+
+    assert time.monotonic() - start >= 0.04
+
+
+def test_interprocess_semaphore_capacity_mismatch(lock_dir):
+    semaphore_path = os.path.join(lock_dir, 'semaphore')
+    pl.InterProcessSemaphore(semaphore_path, 2)
+
+    with pytest.raises(pl.InterProcessSemaphoreCapacityError):
+        pl.InterProcessSemaphore(semaphore_path, 3)
+
+    with open(os.path.join(semaphore_path, 'capacity')) as capacity_file:
+        assert capacity_file.read() == '2'
+
+
+@pytest.mark.parametrize('capacity', [0, -1, 1.0, True])
+def test_interprocess_semaphore_invalid_capacity(lock_dir, capacity):
+    semaphore_path = os.path.join(lock_dir, 'semaphore')
+    with pytest.raises(ValueError):
+        pl.InterProcessSemaphore(semaphore_path, capacity)
+
+
+def test_interprocess_semaphore_rejects_double_release(lock_dir):
+    semaphore_path = os.path.join(lock_dir, 'semaphore')
+    semaphore = pl.InterProcessSemaphore(semaphore_path, 1)
+    permit = semaphore.acquire()
+    permit.release()
+
+    with pytest.raises(pl.InterProcessSemaphoreReleaseError):
+        permit.release()
+
+
+def test_interprocess_semaphore_rejects_wrong_process_release(lock_dir):
+    semaphore_path = os.path.join(lock_dir, 'semaphore')
+    semaphore = pl.InterProcessSemaphore(semaphore_path, 1)
+    permit = semaphore.acquire()
+    permit._owner_pid += 1
+
+    with pytest.raises(pl.InterProcessSemaphoreReleaseError):
+        permit.release()
+
+    assert not permit._released
+    permit._owner_pid = os.getpid()
+    permit.release()
+
+
+@pytest.mark.skipif(WIN32, reason='fork is not available on Windows')
+def test_interprocess_semaphore_rejects_forked_handle(lock_dir):
+    ctx = multiprocessing.get_context('fork')
+    semaphore_path = os.path.join(lock_dir, 'semaphore')
+    semaphore = pl.InterProcessSemaphore(semaphore_path, 1)
+    permit = semaphore.acquire()
+    parent_conn, child_conn = ctx.Pipe(False)
+    child = ctx.Process(
+        target=_release_inherited_permit,
+        args=(permit, child_conn))
+
+    with scoped_child_processes((child,), timeout=10):
+        assert parent_conn.poll(10)
+        error_type, _ = parent_conn.recv()
+        assert error_type == 'InterProcessSemaphoreReleaseError'
+
+    permit.release()
+
+
+@pytest.mark.skipif(WIN32, reason='fork is not available on Windows')
+def test_interprocess_semaphore_recovers_after_holder_exit(lock_dir):
+    ctx = multiprocessing.get_context('fork')
+    semaphore_path = os.path.join(lock_dir, 'semaphore')
+    workers = []
+    try:
+        for _ in range(4):
+            parent_conn, child_conn = ctx.Pipe()
+            child = ctx.Process(
+                target=_semaphore_worker,
+                args=(semaphore_path, 3, child_conn))
+            child.daemon = True
+            child.start()
+            workers.append((child, parent_conn))
+
+        entered = []
+        deadline = time.time() + 10
+        while len(entered) < 3 and time.time() < deadline:
+            for child, conn in workers:
+                if conn.poll(0.01):
+                    event, slot, pid = conn.recv()
+                    assert event == 'entered'
+                    entered.append((child, conn, slot, pid))
+
+        assert len(entered) == 3
+        waiting = [
+            (child, conn) for child, conn in workers
+            if child not in [entered_child for entered_child, _, _, _ in entered]
+        ]
+        assert len(waiting) == 1
+        waiting_child, waiting_conn = waiting[0]
+        assert not waiting_conn.poll(0.5)
+
+        terminated_child, terminated_conn, terminated_slot, _ = entered[0]
+        terminated_child.terminate()
+        terminated_child.join(10)
+        assert not terminated_child.is_alive()
+
+        assert waiting_conn.poll(10)
+        event, slot, pid = waiting_conn.recv()
+        assert event == 'entered'
+        assert slot == terminated_slot
+        assert pid == waiting_child.pid
+        simultaneous = {
+            (child.pid, held_slot)
+            for child, _, held_slot, held_pid in entered[1:]
+        }
+        simultaneous.add((waiting_child.pid, slot))
+        assert len(simultaneous) == 3
+
+        for child, conn, _, _ in entered[1:]:
+            conn.send('release')
+            assert conn.recv()[0] == 'released'
+            conn.send('exit')
+
+        waiting_conn.send('release')
+        assert waiting_conn.recv()[0] == 'released'
+        waiting_conn.send('exit')
+        waiting_child.join(10)
+        assert not waiting_child.is_alive()
+    finally:
+        for child, conn in workers:
+            if child.is_alive():
+                try:
+                    conn.send('exit')
+                except (BrokenPipeError, EOFError, OSError):
+                    pass
+            child.join(10)
+            if child.is_alive():
+                child.terminate()
+                child.join()

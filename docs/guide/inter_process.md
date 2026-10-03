@@ -46,6 +46,32 @@ lock.acquire_write_lock(timeout=10)
 lock.release_write_lock()
 ```
 
+## Semaphores
+
+A fixed number of independent processes can share permits using
+`InterProcessSemaphore`. The path names the semaphore, and the capacity is
+stored with that path. Opening the same path with a different capacity raises
+`InterProcessSemaphoreCapacityError` rather than creating a separate limit.
+
+```python
+import fasteners
+
+semaphore = fasteners.InterProcessSemaphore('path/to/compression.slots', 3)
+
+permit = semaphore.acquire(timeout=30)
+if permit is None:
+    raise TimeoutError("No compression slot became available")
+
+with permit:
+    ...  # one of three compression slots
+```
+
+The returned permit must be released by the acquiring process. Releasing it
+twice or from a forked child raises `InterProcessSemaphoreReleaseError`. If a
+holding process exits, the operating system releases the underlying slot lock;
+the slot files are not deleted and process liveness is not inferred from
+heartbeats.
+
 ## Decorators
 
 For extra sugar, a function that always needs exclusive / read / write access

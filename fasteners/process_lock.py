@@ -23,6 +23,7 @@ import os
 from pathlib import Path
 import threading
 import time
+import weakref
 from typing import Callable
 from typing import Optional
 from typing import Union
@@ -32,6 +33,23 @@ from fasteners.process_mechanism import _interprocess_mechanism
 from fasteners.process_mechanism import _interprocess_reader_writer_mechanism
 
 LOG = logging.getLogger(__name__)
+
+_semaphore_state_lock = threading.RLock()
+_semaphore_held_slots = set()
+
+
+class InterProcessSemaphoreError(Exception):
+    """Base class for interprocess semaphore errors."""
+
+
+class InterProcessSemaphoreCapacityError(
+        InterProcessSemaphoreError, ValueError):
+    """Raised when a semaphore path is used with a different capacity."""
+
+
+class InterProcessSemaphoreReleaseError(
+        InterProcessSemaphoreError, RuntimeError):
+    """Raised when a semaphore permit cannot be released by the caller."""
 
 
 def _ensure_tree(path):
@@ -53,6 +71,221 @@ def _ensure_tree(path):
             raise
     else:
         return True
+
+
+class InterProcessSemaphorePermit:
+    """A permit representing one acquired interprocess semaphore slot."""
+
+    _instances = weakref.WeakSet()
+
+    def __init__(self, slot: int, slot_path: bytes, slot_file,
+                 semaphore: "InterProcessSemaphore"):
+        self.slot = slot
+        self.slot_path = slot_path
+        self._slot_file = slot_file
+        self._semaphore = semaphore
+        self._owner_pid = os.getpid()
+        self._released = False
+        self._inherited_after_fork = False
+        self._release_lock = threading.Lock()
+        self._instances.add(self)
+
+    def _mark_inherited_after_fork(self):
+        self._inherited_after_fork = True
+        slot_file = self._slot_file
+        self._slot_file = None
+        if slot_file is not None and not slot_file.closed:
+            try:
+                slot_file.close()
+            except OSError:
+                pass
+
+    @classmethod
+    def _after_fork_in_child(cls):
+        for permit in list(cls._instances):
+            permit._mark_inherited_after_fork()
+        _semaphore_held_slots.clear()
+
+    def release(self):
+        """Release this permit.
+
+        Release is allowed once and only from the process that acquired the
+        permit. Permits inherited by a forked child are invalid in that child.
+        """
+        with self._release_lock:
+            if self._inherited_after_fork:
+                raise InterProcessSemaphoreReleaseError(
+                    "Semaphore permit cannot be released by a forked child")
+            if os.getpid() != self._owner_pid:
+                raise InterProcessSemaphoreReleaseError(
+                    "Semaphore permit can only be released by the process "
+                    "that acquired it")
+            if self._released:
+                raise InterProcessSemaphoreReleaseError(
+                    "Semaphore permit was already released")
+
+            self._released = True
+            try:
+                _interprocess_mechanism.unlock(self._slot_file)
+            except (IOError, OSError) as e:
+                self._released = False
+                raise InterProcessSemaphoreReleaseError(
+                    "Could not release semaphore slot %s on `%s`"
+                    % (self.slot, self.slot_path)) from e
+
+            try:
+                self._slot_file.close()
+            except (IOError, OSError):
+                self._semaphore.logger.exception(
+                    "Could not close semaphore slot file `%s`",
+                    self.slot_path)
+            finally:
+                self._slot_file = None
+                _semaphore_held_slots.discard(self.slot_path)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.release()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(
+        after_in_child=InterProcessSemaphorePermit._after_fork_in_child)
+
+
+class InterProcessSemaphore:
+    """A named counting semaphore backed by operating system locks."""
+
+    def __init__(self,
+                 path: Union[Path, str],
+                 capacity: int,
+                 sleep_func: Callable[[float], None] = time.sleep,
+                 logger: Optional[logging.Logger] = None):
+        if type(capacity) is not int or capacity <= 0:
+            raise ValueError("Capacity must be a positive integer")
+
+        self.path = os.path.realpath(_utils.canonicalize_path(path))
+        self.capacity = capacity
+        self.sleep_func = sleep_func
+        self.logger = _utils.pick_first_not_none(logger, LOG)
+        self._control_path = os.path.join(self.path, b"control")
+        self._capacity_path = os.path.join(self.path, b"capacity")
+        self._slot_paths = [
+            os.path.join(self.path, ("slot-%d" % slot).encode())
+            for slot in range(capacity)
+        ]
+        self._control_lock = InterProcessLock(
+            self._control_path,
+            sleep_func=sleep_func,
+            logger=self.logger)
+        self._initialize()
+
+    def _read_capacity(self):
+        try:
+            with open(self._capacity_path, "r") as capacity_file:
+                value = int(capacity_file.read().strip())
+        except (IOError, OSError, ValueError) as e:
+            raise InterProcessSemaphoreCapacityError(
+                "Semaphore capacity metadata at `%s` is invalid"
+                % self._capacity_path) from e
+        return value
+
+    def _write_capacity(self):
+        temporary_path = self._capacity_path + b".tmp"
+        with open(temporary_path, "w") as capacity_file:
+            capacity_file.write(str(self.capacity))
+            capacity_file.flush()
+            os.fsync(capacity_file.fileno())
+        os.replace(temporary_path, self._capacity_path)
+
+    def _initialize(self):
+        with _semaphore_state_lock:
+            _ensure_tree(self.path)
+            acquired = self._control_lock.acquire(blocking=True)
+            if not acquired:
+                raise InterProcessSemaphoreError(
+                    "Unable to initialize semaphore at `%s`" % self.path)
+            try:
+                if os.path.exists(self._capacity_path):
+                    existing_capacity = self._read_capacity()
+                    if existing_capacity != self.capacity:
+                        raise InterProcessSemaphoreCapacityError(
+                            "Semaphore at `%s` has capacity %d, not %d"
+                            % (self.path, existing_capacity, self.capacity))
+                else:
+                    for slot_path in self._slot_paths:
+                        open(slot_path, "a").close()
+                    self._write_capacity()
+
+                for slot_path in self._slot_paths:
+                    if not os.path.exists(slot_path):
+                        open(slot_path, "a").close()
+            finally:
+                self._control_lock.release()
+
+    def _try_acquire_slot(self, blocking: bool, watch: _utils.StopWatch):
+        with _semaphore_state_lock:
+            timeout = watch.leftover()
+            acquired = self._control_lock.acquire(
+                blocking=blocking, timeout=timeout)
+            if not acquired:
+                if not blocking or watch.expired():
+                    return None
+                raise _utils.RetryAgain()
+
+            try:
+                for slot, slot_path in enumerate(self._slot_paths):
+                    if slot_path in _semaphore_held_slots:
+                        continue
+
+                    slot_file = None
+                    try:
+                        slot_file = open(slot_path, "a")
+                        _interprocess_mechanism.trylock(slot_file)
+                    except (IOError, OSError) as e:
+                        if slot_file is not None:
+                            slot_file.close()
+                        if e.errno in (errno.EACCES, errno.EAGAIN):
+                            continue
+                        raise threading.ThreadError(
+                            "Unable to acquire semaphore slot %s on `%s` due "
+                            "to %s" % (slot, slot_path, e))
+
+                    _semaphore_held_slots.add(slot_path)
+                    return InterProcessSemaphorePermit(
+                        slot, slot_path, slot_file, self)
+            finally:
+                self._control_lock.release()
+
+            if not blocking or watch.expired():
+                return None
+            raise _utils.RetryAgain()
+
+    def acquire(self,
+                blocking: bool = True,
+                delay: float = 0.01,
+                max_delay: float = 0.1,
+                timeout: Optional[float] = None
+                ) -> Optional[InterProcessSemaphorePermit]:
+        """Acquire one permit, waiting up to ``timeout`` seconds when blocking.
+
+        Returns ``None`` when a blocking request times out or a non-blocking
+        request cannot be satisfied immediately.
+        """
+        if delay < 0:
+            raise ValueError("Delay must be greater than or equal to zero")
+        if timeout is not None and timeout < 0:
+            raise ValueError("Timeout must be greater than or equal to zero")
+        if delay >= max_delay:
+            max_delay = delay
+
+        watch = _utils.StopWatch(duration=timeout)
+        retry = _utils.Retry(
+            delay, max_delay, sleep_func=self.sleep_func, watch=watch)
+        with watch:
+            return retry(self._try_acquire_slot, blocking, watch)
 
 
 class InterProcessLock:
