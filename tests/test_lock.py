@@ -592,3 +592,308 @@ def test_error_when_releasing_read_lock_without_read_lock():
     lock = fasteners.ReaderWriterLock()
     with pytest.raises(RuntimeError):
         lock.release_read_lock()
+
+
+def _wait_until(predicate, timeout=WAIT_TIMEOUT):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if predicate():
+            return
+        time.sleep(0.001)
+    assert predicate()
+
+
+def test_upgradeable_read_lock_is_unique_and_reentrant():
+    lock = fasteners.ReaderWriterLock()
+
+    assert lock.acquire_upgradeable_read_lock()
+    assert lock.is_reader()
+    assert lock.is_upgradeable_reader()
+    assert lock.acquire_upgradeable_read_lock()
+
+    acquired = collections.deque()
+    other = _daemon_thread(
+        lambda: acquired.append(lock.acquire_upgradeable_read_lock(blocking=False)))
+    other.start()
+    other.join()
+    assert list(acquired) == [False]
+
+    lock.release_upgradeable_read_lock()
+    assert lock.is_reader()
+    assert lock.is_upgradeable_reader()
+
+    lock.release_upgradeable_read_lock()
+    assert not lock.is_reader()
+    assert not lock.is_upgradeable_reader()
+
+
+def test_read_and_write_lock_timeouts_return_false():
+    lock = fasteners.ReaderWriterLock()
+    reader_ready = threading.Event()
+    release_reader = threading.Event()
+
+    def reader():
+        lock.acquire_read_lock()
+        reader_ready.set()
+        release_reader.wait(WAIT_TIMEOUT)
+        lock.release_read_lock()
+
+    other = _daemon_thread(reader)
+    other.start()
+    reader_ready.wait(WAIT_TIMEOUT)
+
+    assert not lock.acquire_write_lock(timeout=0.01)
+    release_reader.set()
+    assert lock.acquire_write_lock(timeout=0.01)
+
+    writer_release = threading.Event()
+    writer_done = threading.Event()
+
+    def waiting_reader():
+        assert not lock.acquire_read_lock(timeout=0.01)
+        writer_release.set()
+        assert lock.acquire_read_lock(timeout=WAIT_TIMEOUT)
+        lock.release_read_lock()
+        writer_done.set()
+
+    waiter = _daemon_thread(waiting_reader)
+    waiter.start()
+    writer_release.wait(WAIT_TIMEOUT)
+    lock.release_write_lock()
+    writer_done.wait(WAIT_TIMEOUT)
+
+    waiter.join(WAIT_TIMEOUT)
+    other.join(WAIT_TIMEOUT)
+    assert writer_done.is_set()
+
+
+def test_ordinary_reader_can_not_acquire_upgradeable_read_lock():
+    lock = fasteners.ReaderWriterLock()
+
+    lock.acquire_read_lock()
+    with pytest.raises(RuntimeError):
+        lock.acquire_upgradeable_read_lock()
+    assert lock.is_reader()
+    assert not lock.is_upgradeable_reader()
+
+    lock.release_read_lock()
+
+
+def test_ordinary_reader_can_not_upgrade():
+    lock = fasteners.ReaderWriterLock()
+
+    lock.acquire_read_lock()
+    with pytest.raises(RuntimeError):
+        lock.acquire_upgrade_write_lock()
+
+    assert lock.is_reader()
+    assert not lock.is_upgradeable_reader()
+    lock.release_read_lock()
+
+
+def test_failed_upgrade_preserves_upgradeable_read_entries():
+    lock = fasteners.ReaderWriterLock()
+
+    assert lock.acquire_upgradeable_read_lock()
+    assert lock.acquire_upgradeable_read_lock()
+
+    other_ready = threading.Event()
+    other_release = threading.Event()
+
+    def other_reader():
+        lock.acquire_read_lock()
+        other_ready.set()
+        other_release.wait(WAIT_TIMEOUT)
+        lock.release_read_lock()
+
+    other = _daemon_thread(other_reader)
+    other.start()
+    other_ready.wait(WAIT_TIMEOUT)
+
+    assert not lock.acquire_upgrade_write_lock(timeout=0.01)
+    assert not lock.is_writer(check_pending=False)
+    assert lock.is_reader()
+    assert lock.is_upgradeable_reader()
+    assert not lock.has_pending_writers
+
+    other_release.set()
+    other.join()
+
+    lock.release_upgradeable_read_lock()
+    assert lock.is_reader()
+    assert lock.is_upgradeable_reader()
+    lock.release_upgradeable_read_lock()
+    assert not lock.is_reader()
+
+
+def test_upgrade_write_lock_context_downgrades():
+    lock = fasteners.ReaderWriterLock()
+
+    with lock.upgradeable_read_lock():
+        assert lock.is_upgradeable_reader()
+        with lock.upgrade_write_lock(timeout=0.01):
+            assert lock.is_writer(check_pending=False)
+            assert lock.is_upgradeable_reader()
+        assert not lock.is_writer(check_pending=False)
+        assert lock.is_reader()
+        assert lock.is_upgradeable_reader()
+
+    assert not lock.is_reader()
+    assert not lock.is_upgradeable_reader()
+
+
+def test_upgrade_write_lock_context_restores_nested_write_entries():
+    lock = fasteners.ReaderWriterLock()
+
+    with lock.upgradeable_read_lock():
+        with lock.upgrade_write_lock(timeout=0.01):
+            assert lock.acquire_write_lock()
+            assert lock.is_writer(check_pending=False)
+
+        assert lock.is_upgradeable_reader()
+        assert not lock.is_writer(check_pending=False)
+
+    assert not lock.is_reader()
+
+
+def test_upgradeable_read_layer_can_not_be_released_as_writer():
+    lock = fasteners.ReaderWriterLock()
+
+    with lock.upgradeable_read_lock():
+        assert lock.acquire_upgrade_write_lock()
+        with pytest.raises(RuntimeError):
+            lock.release_upgradeable_read_lock()
+
+        assert lock.is_writer(check_pending=False)
+        assert lock.is_upgradeable_reader()
+        lock.downgrade_write_lock()
+
+    assert not lock.is_reader()
+    assert not lock.is_upgradeable_reader()
+
+
+def test_upgrade_waits_for_old_readers_and_blocks_new_readers_and_writer():
+    condition_waits = []
+
+    class CountingCondition(threading.Condition):
+        def wait(self, timeout=None):
+            condition_waits.append(timeout)
+            return super().wait(timeout)
+
+    condition = CountingCondition()
+    lock = fasteners.ReaderWriterLock(condition_cls=lambda: condition)
+    events = collections.deque()
+
+    reader_ready = threading.Event()
+    release_reader = threading.Event()
+    late_reader_entered = threading.Event()
+    writer_entered = threading.Event()
+
+    def old_reader():
+        lock.acquire_read_lock()
+        events.append('reader-enter')
+        reader_ready.set()
+        release_reader.wait(WAIT_TIMEOUT)
+        lock.release_read_lock()
+
+    def queued_writer():
+        lock.acquire_write_lock()
+        events.append('writer-enter')
+        writer_entered.set()
+        time.sleep(0.01)
+        lock.release_write_lock()
+        events.append('writer-exit')
+
+    def late_reader():
+        lock.acquire_read_lock()
+        events.append('late-reader-enter')
+        late_reader_entered.set()
+        lock.release_read_lock()
+
+    lock.acquire_upgradeable_read_lock()
+
+    reader = _daemon_thread(old_reader)
+    reader.start()
+    reader_ready.wait(WAIT_TIMEOUT)
+
+    writer = _daemon_thread(queued_writer)
+    writer.start()
+    _wait_until(lambda: lock.has_pending_writers)
+    _wait_until(lambda: len(condition_waits) >= 1)
+
+    late_reader = _daemon_thread(late_reader)
+    late_reader.start()
+    _wait_until(lambda: len(condition_waits) >= 2)
+    assert not late_reader_entered.is_set()
+
+    release_reader.set()
+    assert lock.acquire_upgrade_write_lock()
+    events.append('upgrade-enter')
+
+    assert not writer_entered.is_set()
+    assert not late_reader_entered.is_set()
+
+    lock.downgrade_write_lock()
+    events.append('downgraded-reader')
+    assert not writer_entered.is_set()
+    assert lock.is_upgradeable_reader()
+
+    lock.release_upgradeable_read_lock()
+    assert not late_reader_entered.is_set()
+    writer.join(WAIT_TIMEOUT)
+    assert writer_entered.is_set()
+
+    late_reader.join(WAIT_TIMEOUT)
+    reader.join(WAIT_TIMEOUT)
+
+    assert list(events) == [
+        'reader-enter',
+        'upgrade-enter',
+        'downgraded-reader',
+        'writer-enter',
+        'writer-exit',
+        'late-reader-enter',
+    ]
+
+
+def test_plain_writer_downgrade_is_atomic():
+    lock = fasteners.ReaderWriterLock()
+    writer_entered = threading.Event()
+
+    def queued_writer():
+        lock.acquire_write_lock()
+        writer_entered.set()
+        lock.release_write_lock()
+
+    lock.acquire_write_lock()
+    writer = _daemon_thread(queued_writer)
+    writer.start()
+
+    _wait_until(lambda: lock.has_pending_writers)
+    assert not writer_entered.is_set()
+
+    lock.downgrade_write_lock()
+    assert lock.is_reader()
+    assert not lock.is_writer(check_pending=False)
+    assert lock.has_pending_writers
+    assert not writer_entered.is_set()
+
+    lock.release_read_lock()
+    writer.join(WAIT_TIMEOUT)
+    assert writer_entered.is_set()
+
+
+def test_write_lock_can_not_downgrade_while_reentered():
+    lock = fasteners.ReaderWriterLock()
+
+    lock.acquire_write_lock()
+    lock.acquire_write_lock()
+
+    with pytest.raises(RuntimeError):
+        lock.downgrade_write_lock()
+
+    assert lock.is_writer(check_pending=False)
+    lock.release_write_lock()
+    assert lock.is_writer(check_pending=False)
+    lock.release_write_lock()
+    assert not lock.is_writer(check_pending=False)

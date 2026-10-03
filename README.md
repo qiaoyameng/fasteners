@@ -110,7 +110,7 @@ The `fasteners.ReaderWriterLock` at the moment is as follows:
 
 | lock | reentrant | mandatory | upgradable | preference | 
 |------|-----------|-----------|-------------|------------|
-| fasteners.ReaderWriterLock | ✔ | ✘ | ✘ | writer |
+| fasteners.ReaderWriterLock | ✔ | ✘ | ✔ (explicit) | writer |
 
 If your threads are created by some other means than the standard library `threading`
 module (for example `eventlet`), you may need to provide the corresponding thread

@@ -19,19 +19,28 @@ with rw_lock.write_lock():
 
 with rw_lock.read_lock():
     ...  # read access
+
+with rw_lock.upgradeable_read_lock():
+    ...  # read access
+    with rw_lock.upgrade_write_lock():
+        ...  # write access
 ```
 
 ## (Lack of) Features
 
 Fasteners inter-thread readers writer lock is
 
-* not [upgradeable]. An attempt to get a reader's lock while holding a writer's
-  lock (or vice versa) will raise an exception.
+* supports an explicit [upgradeable] read lock. Only one thread may hold the
+  upgradeable read lock, and ordinary read locks can not be upgraded. Use
+  `upgrade_write_lock()` to upgrade, and `downgrade_write_lock()` to perform an
+  atomic write-to-read transition.
 
 * [reentrant] (!). You can acquire (and correspondingly release) the lock
   multiple times.
 
 * has writer preference. Readers will queue after writers and pending writers.
+  An upgrade request blocks new readers and waits for readers that already
+  entered; failed or timed out upgrades retain the caller's read lock layers.
 
 [upgradeable]: https://en.wikipedia.org/wiki/Readers%E2%80%93writer_lock#Upgradable_RW_lock>
 
@@ -47,4 +56,3 @@ functions to the `ReaderWriterLock`.
 
 In particular, in case of `eventlet` threads, you should monkey_patch the stdlib threads with `eventlet.monkey_patch(tread=True)`
 and initialise the `ReaderWriterLock` as `ReaderWriterLock(current_thread_functor=eventlet.getcurrent)`.
-
