@@ -3,6 +3,8 @@
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
 
 ## [Unreleased]
+  - Add `blocking` and `timeout` arguments to the inter thread
+    `ReaderWriterLock` acquisition methods and context managers.
 
 ## [0.20]
   - InterProcessLock now catches OSError and handles BlockingIOError correctly.

@@ -20,7 +20,9 @@
 import collections
 import contextlib
 import functools
+import math
 import threading
+import time
 from typing import Optional
 
 from fasteners import _utils
@@ -34,7 +36,8 @@ class ReaderWriterLock(object):
 
     def __init__(self,
                  condition_cls=threading.Condition,
-                 current_thread_functor=threading.current_thread):
+                 current_thread_functor=threading.current_thread,
+                 time_func=time.monotonic):
         """
         Args:
             condition_cls:
@@ -42,6 +45,9 @@ class ReaderWriterLock(object):
             current_thread_functor:
                 Optional function that returns the identity of the thread in case
                 threads are not properly identified by threading.current_thread
+            time_func:
+                Optional monotonic clock function used to calculate acquisition
+                deadlines.
         """
         self._writer = None
         self._writer_entries = 0
@@ -49,6 +55,7 @@ class ReaderWriterLock(object):
         self._readers = {}
         self._cond = condition_cls()
         self._current_thread = current_thread_functor
+        self._time = time_func
 
     @property
     def has_pending_writers(self) -> bool:
@@ -100,16 +107,31 @@ class ReaderWriterLock(object):
             return self.READER
         return None
 
-    def acquire_read_lock(self):
+    def acquire_read_lock(self,
+                          blocking: bool = True,
+                          timeout: Optional[float] = None) -> bool:
         """Acquire a read lock.
 
-        Will wait until no active or pending writers.
+        When blocking, wait until no active or pending writers or until the
+        timeout expires.
+
+        Args:
+            blocking:
+                Whether to wait for the lock if it can not be acquired
+                immediately.
+            timeout:
+                When blocking, maximum waiting time in seconds.
+
+        Returns:
+            Whether the read lock was acquired.
 
         Raises:
+            ValueError: if timeout is negative or not a number.
             RuntimeError: if a pending writer tries to acquire a read lock.
         """
         me = self._current_thread()
-        self._acquire_read_lock(me)
+        self._validate_timeout(timeout)
+        return self._acquire_read_lock(me, blocking, timeout)
 
     def release_read_lock(self):
         """Release a read lock.
@@ -120,13 +142,26 @@ class ReaderWriterLock(object):
         me = self._current_thread()
         self._release_read_lock(me)
 
-    def _acquire_read_lock(self, me):
+    def _validate_timeout(self, timeout):
+        if timeout is not None:
+            if timeout < 0 or math.isnan(timeout):
+                raise ValueError("Timeout must be greater than or equal to zero")
+
+    def _acquire_read_lock(self, me, blocking=True, timeout=None):
         if me in self._pending_writers:
             raise RuntimeError("Writer %s can not acquire a read lock"
                                " while waiting for the write lock"
                                % me)
         with self._cond:
+            deadline = None
+            if blocking and timeout is not None:
+                deadline = self._time() + timeout
+            waited = False
             while True:
+                if waited and deadline is not None:
+                    remaining = deadline - self._time()
+                    if remaining <= 0:
+                        return False
                 # No active writer, or we are the writer;
                 # Also no pending writers;
                 # we are good to become a reader.
@@ -134,12 +169,21 @@ class ReaderWriterLock(object):
                     if me in self._readers:
                         # ok to get a lock if current thread already has one
                         self._readers[me] = self._readers[me] + 1
-                        break
+                        return True
                     elif (self._writer == me) or not self.has_pending_writers:
                         self._readers[me] = 1
-                        break
+                        return True
                 # An active or pending writer; guess we have to wait.
-                self._cond.wait()
+                if not blocking:
+                    return False
+                if deadline is None:
+                    self._cond.wait()
+                else:
+                    remaining = deadline - self._time()
+                    if remaining <= 0:
+                        return False
+                    self._cond.wait(remaining)
+                waited = True
 
     def _release_read_lock(self, me, raise_on_not_owned=True):
         # I am no longer a reader, remove *one* occurrence of myself.
@@ -159,36 +203,88 @@ class ReaderWriterLock(object):
             self._cond.notify_all()
 
     @contextlib.contextmanager
-    def read_lock(self):
+    def read_lock(self,
+                  blocking: bool = True,
+                  timeout: Optional[float] = None):
         """Context manager that grants a read lock.
 
-        Will wait until no active or pending writers.
+        When blocking, waits until no active or pending writers or until the
+        timeout expires.
+
+        Args:
+            blocking:
+                Whether to wait for the lock if it can not be acquired
+                immediately.
+            timeout:
+                When blocking, maximum waiting time in seconds.
+
+        Returns:
+            This lock when the read lock is acquired.
 
         Raises:
+            ValueError: if timeout is negative or not a number.
+            RuntimeError: if the read lock can not be acquired.
             RuntimeError: if a pending writer tries to acquire a read lock.
         """
         me = self._current_thread()
-        self._acquire_read_lock(me)
+        self._validate_timeout(timeout)
+        if not self._acquire_read_lock(me, blocking, timeout):
+            raise RuntimeError("Unable to acquire a read lock")
         try:
             yield self
         finally:
             self._release_read_lock(me, raise_on_not_owned=False)
 
-    def _acquire_write_lock(self, me):
+    def _acquire_write_lock(self, me, blocking=True, timeout=None):
         if self.is_reader():
             raise RuntimeError("Reader %s to writer privilege"
                                " escalation not allowed" % me)
 
         with self._cond:
+            can_acquire = (len(self._readers) == 0 and
+                           self._writer is None and
+                           (not self._pending_writers or
+                            self._pending_writers[0] == me))
+            if can_acquire:
+                self._writer = me
+                self._writer_entries = 1
+                return True
+
+            if not can_acquire and not blocking:
+                return False
+
+            deadline = None
+            if timeout is not None:
+                deadline = self._time() + timeout
+                if deadline <= self._time():
+                    return False
+
             self._pending_writers.append(me)
+
+            waited = False
             while True:
+                if waited and deadline is not None:
+                    remaining = deadline - self._time()
+                    if remaining <= 0:
+                        self._pending_writers.remove(me)
+                        self._cond.notify_all()
+                        return False
                 # No readers, and no active writer, am I next??
                 if len(self._readers) == 0 and self._writer is None:
                     if self._pending_writers[0] == me:
                         self._writer = self._pending_writers.popleft()
                         self._writer_entries = 1
-                        break
-                self._cond.wait()
+                        return True
+                if deadline is None:
+                    self._cond.wait()
+                else:
+                    remaining = deadline - self._time()
+                    if remaining <= 0:
+                        self._pending_writers.remove(me)
+                        self._cond.notify_all()
+                        return False
+                    self._cond.wait(remaining)
+                waited = True
 
     def _release_write_lock(self, me, raise_on_not_owned=True):
         with self._cond:
@@ -196,21 +292,37 @@ class ReaderWriterLock(object):
             self._writer_entries = 0
             self._cond.notify_all()
 
-    def acquire_write_lock(self):
+    def acquire_write_lock(self,
+                           blocking: bool = True,
+                           timeout: Optional[float] = None) -> bool:
         """Acquire a write lock.
 
-        Will wait until no active readers. Blocks readers after acquiring.
+        When blocking, waits until no active readers or until the timeout
+        expires. Blocks readers after acquiring.
 
         Guaranteed for locks to be processed in fair order (FIFO).
 
+        Args:
+            blocking:
+                Whether to wait for the lock if it can not be acquired
+                immediately.
+            timeout:
+                When blocking, maximum waiting time in seconds.
+
+        Returns:
+            Whether the write lock was acquired.
+
         Raises:
+            ValueError: if timeout is negative or not a number.
             RuntimeError: if an active reader attempts to acquire a lock.
         """
         me = self._current_thread()
+        self._validate_timeout(timeout)
         if self._writer == me:
             self._writer_entries += 1
+            return True
         else:
-            self._acquire_write_lock(me)
+            return self._acquire_write_lock(me, blocking, timeout)
 
     def release_write_lock(self):
         """Release a write lock.
@@ -227,17 +339,33 @@ class ReaderWriterLock(object):
             raise RuntimeError(f"Thread {me} does not own a write lock")
 
     @contextlib.contextmanager
-    def write_lock(self):
+    def write_lock(self,
+                   blocking: bool = True,
+                   timeout: Optional[float] = None):
         """Context manager that grants a write lock.
 
-        Will wait until no active readers. Blocks readers after acquiring.
+        When blocking, waits until no active readers or until the timeout
+        expires. Blocks readers after acquiring.
 
         Guaranteed for locks to be processed in fair order (FIFO).
 
+        Args:
+            blocking:
+                Whether to wait for the lock if it can not be acquired
+                immediately.
+            timeout:
+                When blocking, maximum waiting time in seconds.
+
+        Returns:
+            This lock when the write lock is acquired.
+
         Raises:
+            ValueError: if timeout is negative or not a number.
+            RuntimeError: if the write lock can not be acquired.
             RuntimeError: if an active reader attempts to acquire a lock.
         """
         me = self._current_thread()
+        self._validate_timeout(timeout)
         if self.is_writer(check_pending=False):
             self._writer_entries += 1
             try:
@@ -245,7 +373,8 @@ class ReaderWriterLock(object):
             finally:
                 self._writer_entries -= 1
         else:
-            self._acquire_write_lock(me)
+            if not self._acquire_write_lock(me, blocking, timeout):
+                raise RuntimeError("Unable to acquire a write lock")
             try:
                 yield self
             finally:

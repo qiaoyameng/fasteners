@@ -592,3 +592,325 @@ def test_error_when_releasing_read_lock_without_read_lock():
     lock = fasteners.ReaderWriterLock()
     with pytest.raises(RuntimeError):
         lock.release_read_lock()
+
+
+class FakeClock(object):
+    def __init__(self):
+        self._time = 0.0
+        self._lock = threading.Lock()
+
+    def time(self):
+        with self._lock:
+            return self._time
+
+    def advance(self, seconds):
+        with self._lock:
+            self._time += seconds
+
+
+class ControllableCondition(threading.Condition):
+    def __init__(self, clock, poll_interval=100):
+        super().__init__()
+        self._clock = clock
+        self._poll_interval = poll_interval
+        self._stats_lock = threading.Lock()
+        self.wait_calls = []
+        self.active_waiters = 0
+
+    def wait(self, timeout=None):
+        ident = threading.get_ident()
+        with self._stats_lock:
+            self.active_waiters += 1
+        try:
+            if timeout is None:
+                with self._stats_lock:
+                    self.wait_calls.append((ident, timeout))
+                return super().wait()
+
+            deadline = self._clock.time() + timeout
+            while True:
+                remaining = deadline - self._clock.time()
+                if remaining <= 0:
+                    return False
+                with self._stats_lock:
+                    self.wait_calls.append((ident, remaining))
+                super().wait(min(remaining, self._poll_interval))
+        finally:
+            with self._stats_lock:
+                self.active_waiters -= 1
+
+    def wake_all(self):
+        with self:
+            self.notify_all()
+
+    def calls_for(self, thread):
+        with self._stats_lock:
+            return [timeout for ident, timeout in self.wait_calls
+                    if ident == thread.ident]
+
+    def wait_for_active_waiters(self, count):
+        deadline = time.monotonic() + 5
+        while True:
+            with self._stats_lock:
+                if self.active_waiters == count:
+                    return
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+
+    def wait_for_call_count(self, thread, count):
+        deadline = time.monotonic() + 5
+        while True:
+            if len(self.calls_for(thread)) >= count:
+                return
+            assert time.monotonic() < deadline
+            time.sleep(0.005)
+
+
+def wait_for(event):
+    assert event.wait(5)
+
+
+def test_writer_timeout_removes_queued_writer_and_wakes_reader():
+    clock = FakeClock()
+    condition = ControllableCondition(clock)
+    lock = fasteners.ReaderWriterLock(
+        condition_cls=lambda: condition,
+        time_func=clock.time)
+
+    assert lock.acquire_write_lock()
+
+    writer_result = []
+    writer_done = threading.Event()
+
+    def timed_writer():
+        writer_result.append(lock.acquire_write_lock(timeout=1))
+        writer_done.set()
+
+    writer = _daemon_thread(timed_writer)
+    writer.start()
+    condition.wait_for_active_waiters(1)
+
+    reader_got_lock = threading.Event()
+    reader_release = threading.Event()
+    reader_result = []
+
+    def reader():
+        reader_result.append(lock.acquire_read_lock())
+        reader_got_lock.set()
+        wait_for(reader_release)
+        lock.release_read_lock()
+
+    reader_thread = _daemon_thread(reader)
+    reader_thread.start()
+    condition.wait_for_active_waiters(2)
+
+    condition.wake_all()
+    condition.wake_all()
+    condition.wait_for_call_count(writer, 3)
+
+    waits = condition.calls_for(writer)
+    assert waits[:3] == [1, 1, 1]
+
+    clock.advance(1)
+    condition.wake_all()
+    wait_for(writer_done)
+    assert writer_result == [False]
+    assert not lock.has_pending_writers
+    assert lock.is_writer(check_pending=False)
+    assert lock._writer is not writer
+
+    lock.release_write_lock()
+    wait_for(reader_got_lock)
+    assert reader_result == [True]
+    assert lock.owner == lock.READER
+
+    reader_release.set()
+    reader_thread.join(5)
+    writer.join(5)
+    assert not reader_thread.is_alive()
+    assert not writer.is_alive()
+
+
+def test_timed_out_head_writer_allows_following_queue_to_continue():
+    clock = FakeClock()
+    condition = ControllableCondition(clock)
+    lock = fasteners.ReaderWriterLock(
+        condition_cls=lambda: condition,
+        time_func=clock.time)
+
+    assert lock.acquire_write_lock()
+
+    first_writer_result = []
+    first_writer_done = threading.Event()
+
+    def first_writer():
+        first_writer_result.append(lock.acquire_write_lock(timeout=1))
+        first_writer_done.set()
+
+    first_thread = _daemon_thread(first_writer)
+    first_thread.start()
+    condition.wait_for_active_waiters(1)
+
+    second_got_lock = threading.Event()
+    second_release = threading.Event()
+    second_result = []
+
+    def second_writer():
+        second_result.append(lock.acquire_write_lock())
+        second_got_lock.set()
+        wait_for(second_release)
+        lock.release_write_lock()
+
+    second_thread = _daemon_thread(second_writer)
+    second_thread.start()
+    condition.wait_for_active_waiters(2)
+
+    reader_got_lock = threading.Event()
+    reader_release = threading.Event()
+    reader_result = []
+
+    def reader():
+        reader_result.append(lock.acquire_read_lock())
+        reader_got_lock.set()
+        wait_for(reader_release)
+        lock.release_read_lock()
+
+    reader_thread = _daemon_thread(reader)
+    reader_thread.start()
+    condition.wait_for_active_waiters(3)
+
+    condition.wake_all()
+    condition.wake_all()
+    condition.wait_for_call_count(first_thread, 3)
+    clock.advance(1)
+    condition.wake_all()
+    wait_for(first_writer_done)
+
+    assert first_writer_result == [False]
+    assert list(lock._pending_writers) == [second_thread]
+    assert lock._writer is not first_thread
+
+    lock.release_write_lock()
+    wait_for(second_got_lock)
+    assert second_result == [True]
+    assert not reader_got_lock.is_set()
+
+    second_release.set()
+    second_thread.join(5)
+    wait_for(reader_got_lock)
+    assert reader_result == [True]
+
+    reader_release.set()
+    reader_thread.join(5)
+    first_thread.join(5)
+    assert not reader_thread.is_alive()
+    assert not second_thread.is_alive()
+    assert not first_thread.is_alive()
+
+
+def test_nonblocking_acquisition_returns_false_without_queueing():
+    identity = ['owner']
+    lock = fasteners.ReaderWriterLock(
+        current_thread_functor=lambda: identity[0])
+
+    assert lock.acquire_write_lock()
+    identity[-1] = 'other'
+
+    assert not lock.acquire_write_lock(blocking=False)
+    assert not lock.has_pending_writers
+    assert lock._writer == 'owner'
+
+    assert not lock.acquire_read_lock(blocking=False)
+    assert 'other' not in lock._readers
+
+    identity[-1] = 'owner'
+    assert lock.acquire_write_lock(blocking=False, timeout=1)
+    assert lock._writer_entries == 2
+    assert lock.acquire_read_lock(blocking=False)
+    assert lock._readers['owner'] == 1
+
+    lock.release_read_lock()
+    assert lock._writer_entries == 2
+    lock.release_write_lock()
+    assert lock._writer_entries == 1
+    lock.release_write_lock()
+    assert lock.owner is None
+
+
+def test_timed_attempts_return_false_without_blocking():
+    identity = ['owner']
+    lock = fasteners.ReaderWriterLock(
+        current_thread_functor=lambda: identity[0])
+
+    assert lock.acquire_write_lock()
+    identity[-1] = 'reader'
+    assert not lock.acquire_read_lock(timeout=0)
+    assert 'reader' not in lock._readers
+
+    identity[-1] = 'writer'
+    assert not lock.acquire_write_lock(timeout=0)
+    assert not lock.has_pending_writers
+    assert lock._writer == 'owner'
+
+    identity[-1] = 'owner'
+    lock.release_write_lock()
+
+
+def test_reentrant_locks_preserve_counts_with_timeout_options():
+    lock = fasteners.ReaderWriterLock()
+
+    assert lock.acquire_write_lock(timeout=1)
+    assert lock.acquire_write_lock(timeout=1)
+    assert lock._writer_entries == 2
+
+    assert lock.acquire_read_lock(blocking=False)
+    assert lock._readers[threading.current_thread()] == 1
+    lock.release_read_lock()
+    assert not lock.is_reader()
+    assert lock._writer_entries == 2
+
+    lock.release_write_lock()
+    assert lock._writer_entries == 1
+    lock.release_write_lock()
+
+    assert lock.acquire_read_lock(timeout=1)
+    assert lock.acquire_read_lock(blocking=False)
+    assert lock._readers[threading.current_thread()] == 2
+    lock.release_read_lock()
+    assert lock._readers[threading.current_thread()] == 1
+    lock.release_read_lock()
+    assert lock.owner is None
+
+
+@pytest.mark.parametrize("timeout", [-1, float("nan")])
+@pytest.mark.parametrize("kind", ["read", "write"])
+def test_invalid_timeout_is_rejected_before_state_change(timeout, kind):
+    lock = fasteners.ReaderWriterLock()
+    assert lock.acquire_write_lock()
+
+    acquire = getattr(lock, "acquire_%s_lock" % kind)
+    with pytest.raises(ValueError):
+        acquire(timeout=timeout)
+
+    assert lock._writer_entries == 1
+    assert not lock.has_pending_writers
+    lock.release_write_lock()
+
+
+def test_context_managers_raise_when_lock_is_unavailable():
+    identity = ['owner']
+    lock = fasteners.ReaderWriterLock(
+        current_thread_functor=lambda: identity[0])
+    lock.acquire_write_lock()
+
+    identity[-1] = 'other'
+    with pytest.raises(RuntimeError):
+        with lock.write_lock(blocking=False):
+            pytest.fail("write lock should not be entered")
+
+    with pytest.raises(RuntimeError):
+        with lock.read_lock(blocking=False):
+            pytest.fail("read lock should not be entered")
+
+    assert lock._writer == 'owner'
+    assert not lock.has_pending_writers

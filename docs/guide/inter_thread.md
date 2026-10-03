@@ -21,6 +21,12 @@ with rw_lock.read_lock():
     ...  # read access
 ```
 
+`acquire_read_lock` and `acquire_write_lock` also accept `blocking` and
+`timeout`. They return `True` when acquisition succeeds and `False` when a
+non-blocking attempt fails or the timeout expires. The corresponding context
+managers accept the same arguments and raise `RuntimeError` if acquisition
+fails.
+
 ## (Lack of) Features
 
 Fasteners inter-thread readers writer lock is
@@ -47,4 +53,3 @@ functions to the `ReaderWriterLock`.
 
 In particular, in case of `eventlet` threads, you should monkey_patch the stdlib threads with `eventlet.monkey_patch(tread=True)`
 and initialise the `ReaderWriterLock` as `ReaderWriterLock(current_thread_functor=eventlet.getcurrent)`.
-

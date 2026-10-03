@@ -58,6 +58,15 @@ rw_lock.release_read_lock()
 rw_lock.acquire_write_lock()
 ... # write access
 rw_lock.release_write_lock()
+
+# Timed and non-blocking attempts return whether the lock was acquired
+if rw_lock.acquire_write_lock(timeout=5):
+    ...
+    rw_lock.release_write_lock()
+
+if rw_lock.acquire_read_lock(blocking=False):
+    ...
+    rw_lock.release_read_lock()
 ```
 
 🔩 Overview
